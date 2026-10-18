@@ -1,0 +1,22 @@
+[Unit]
+Description=Telegram bot: login notifications and reboot button
+After=network-online.target systemd-journald.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/vps_login_alert_telegram_bot
+ExecStart=/opt/vps_login_alert_telegram_bot/venv/bin/python /opt/vps_login_alert_telegram_bot/bot.py
+Restart=always
+RestartSec=5
+TimeoutStopSec=15
+
+# root нужен для чтения журнала auth и для systemctl reboot
+User=root
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=full
+
+[Install]
+WantedBy=multi-user.target
