@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
-tg-login-bot — уведомления в Telegram о попытках входа на сервер
-(SSH, локальная консоль, su, sudo) + кнопка перезагрузки.
+vps_login_alert_telegram_bot — уведомления в Telegram о попытках входа на сервер
+(SSH, локальная консоль, su, sudo), разбан в fail2ban и кнопка перезагрузки.
 
 Источник событий — systemd-journald (facility auth/authpriv), поэтому
 на Debian 13 не нужен rsyslog и /var/log/auth.log.
 """
 import asyncio
 import html
+import ipaddress
 import json
 import logging
 import os
@@ -45,6 +46,7 @@ SERVER_NAME = os.getenv("SERVER_NAME") or socket.gethostname()
 # 1 — присылать каждую выполненную через sudo команду
 NOTIFY_SUDO_COMMANDS = os.getenv("NOTIFY_SUDO_COMMANDS", "0") == "1"
 REBOOT_CONFIRM_TTL = 60  # секунд на подтверждение перезагрузки
+F2B_JAIL = os.getenv("F2B_JAIL", "sshd")  # jail fail2ban, баны которого показываются
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("tg-login-bot")
@@ -240,11 +242,12 @@ async def build_report(hours: int = 24) -> str:
 BTN_STATUS = "📊 Статус"
 BTN_STATS = "🛡 Попытки входа"
 BTN_REBOOT = "🔄 Перезагрузка"
+BTN_UNBAN = "🔓 Разбанить"
 
 MAIN_KB = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text=BTN_STATUS), KeyboardButton(text=BTN_STATS)],
-        [KeyboardButton(text=BTN_REBOOT)],
+        [KeyboardButton(text=BTN_UNBAN), KeyboardButton(text=BTN_REBOOT)],
     ],
     resize_keyboard=True,
     is_persistent=True,
@@ -262,6 +265,93 @@ def confirm_kb() -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="❌ Отмена", callback_data="reboot:no"),
         ]]
     )
+
+
+# ───────────────────────── fail2ban ─────────────────────────
+# 1.2.3.4   2026-10-18 07:00:00 + 3600 = 2026-10-18 08:00:00
+RX_BAN_WITH_TIME = re.compile(
+    r"^(\S+)\s+(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)\s*\+\s*(-?\d+)\s*=\s*(.+)$"
+)
+
+
+async def run(*cmd: str) -> tuple[int, str]:
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT
+        )
+    except FileNotFoundError:
+        return 127, f"{cmd[0]}: команда не найдена"
+    out, _ = await proc.communicate()
+    return proc.returncode, out.decode(errors="replace").strip()
+
+
+def is_ip(s: str) -> bool:
+    try:
+        ipaddress.ip_address(s)
+        return True
+    except ValueError:
+        return False
+
+
+def fmt_until(s: str) -> str:
+    try:
+        return "до " + datetime.strptime(s.strip(), "%Y-%m-%d %H:%M:%S").strftime("%d.%m %H:%M")
+    except ValueError:
+        return ""
+
+
+async def f2b_bans() -> list[tuple[str, str]] | None:
+    """Забаненные IP, самые свежие первыми: [(ip, 'до 18.10 08:00')]. None — fail2ban недоступен."""
+    rc, out = await run("fail2ban-client", "get", F2B_JAIL, "banip", "--with-time")
+    if rc == 0:
+        timed = []
+        for line in out.splitlines():
+            if m := RX_BAN_WITH_TIME.match(line.strip()):
+                timed.append((m[2], m[1], fmt_until(m[4])))
+        if timed:
+            timed.sort(reverse=True)
+            return [(ip, until) for _, ip, until in timed]
+        return [(ip, "") for ip in out.split() if is_ip(ip)]
+    rc, out = await run("fail2ban-client", "status", F2B_JAIL)
+    if rc != 0:
+        return None
+    m = re.search(r"Banned IP list:\s*(.*)", out)
+    return [(ip, "") for ip in reversed(m[1].split() if m else []) if is_ip(ip)]
+
+
+async def f2b_unban(ip: str) -> str:
+    rc, out = await run("fail2ban-client", "unban", ip)  # снимает бан во всех jail
+    if rc != 0:
+        return f"❗️ Не удалось разбанить <code>{E(ip)}</code>:\n<pre>{E(out[:1000])}</pre>"
+    if out.strip() == "0":
+        return f"ℹ️ <code>{E(ip)}</code> не был забанен."
+    log.warning("Разбанен %s через Telegram", ip)
+    return f"🔓 <code>{E(ip)}</code> разбанен."
+
+
+async def bans_view(note: str = "") -> tuple[str, InlineKeyboardMarkup | None]:
+    bans = await f2b_bans()
+    lines = [note, ""] if note else []
+    if bans is None:
+        lines.append("❗️ fail2ban не установлен или не запущен.")
+        return "\n".join(lines), None
+    if not bans:
+        lines.append("🟢 Забаненных IP нет.")
+        return "\n".join(lines), None
+    lines += [
+        f"🚫 <b>Забанено IP: {len(bans)}</b> · <code>{E(SERVER_NAME)}</code>",
+        "Нажмите на IP, чтобы разбанить, или пришлите IP сообщением.",
+        "Свой текущий IP можно узнать на 2ip.ru — с той же сети, откуда заходите на сервер.",
+        "",
+    ]
+    for ip, until in bans[:20]:
+        lines.append(f"<code>{E(ip)}</code> {until}".rstrip())
+    if len(bans) > 20:
+        lines.append(f"…и ещё {len(bans) - 20}")
+    buttons = [InlineKeyboardButton(text=f"🔓 {ip}", callback_data=f"unban:{ip}") for ip, _ in bans[:10]]
+    rows = [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
+    rows.append([InlineKeyboardButton(text="🔁 Обновить", callback_data="bans:refresh")])
+    return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 # ───────────────────────── уведомления ─────────────────────────
@@ -310,12 +400,15 @@ async def status_text() -> str:
         sessions = out.decode(errors="replace").strip() or "нет"
     except FileNotFoundError:
         sessions = "loginctl недоступен"
+    bans = await f2b_bans()
+    f2b = "не запущен" if bans is None else f"забанено IP: {len(bans)}"
     return "\n".join([
         f"📊 <b>{E(SERVER_NAME)}</b>",
         f"⏱ Аптайм: {fmt_dur(up)} (загрузка {fmt_time(time.time() - up)})",
         f"⚙️ Load: {l1:.2f} / {l5:.2f} / {l15:.2f} (ядер: {os.cpu_count()})",
         f"🧠 RAM: {total - avail:.0f} / {total:.0f} МБ",
         f"💾 /: {du.used / 2**30:.1f} / {du.total / 2**30:.1f} ГБ",
+        f"🚫 fail2ban: {f2b}",
         "",
         "👥 Активные сессии:",
         f"<pre>{E(sessions[:2500])}</pre>",
@@ -344,7 +437,8 @@ dp.callback_query.filter(F.from_user.id.in_(ADMIN_IDS))
 async def cmd_start(m: Message) -> None:
     await m.answer(
         f"Слежу за входами на <code>{E(SERVER_NAME)}</code>: SSH, консоль, su, sudo.\n\n"
-        "/status — состояние сервера\n/stats — попытки входа за 24 ч\n/reboot — перезагрузка",
+        "/status — состояние сервера\n/stats — попытки входа за 24 ч\n"
+        "/unban — баны fail2ban (или /unban IP)\n/reboot — перезагрузка",
         reply_markup=MAIN_KB,
     )
 
@@ -359,6 +453,49 @@ async def cmd_status(m: Message) -> None:
 @dp.message(F.text == BTN_STATS)
 async def cmd_stats(m: Message) -> None:
     await m.answer(await build_report(24), reply_markup=MAIN_KB)
+
+
+@dp.message(Command("unban"))
+@dp.message(F.text == BTN_UNBAN)
+async def cmd_unban(m: Message) -> None:
+    parts = (m.text or "").split()
+    if len(parts) > 1 and parts[0].startswith("/unban"):  # /unban 1.2.3.4
+        if not is_ip(parts[1]):
+            await m.answer("Это не похоже на IP-адрес.")
+            return
+        text, kb = await bans_view(await f2b_unban(parts[1]))
+    else:
+        text, kb = await bans_view()
+    await m.answer(text, reply_markup=kb)
+
+
+@dp.message(F.text.regexp(r"^\s*[0-9A-Fa-f:.]{3,45}\s*$"))
+async def msg_ip(m: Message) -> None:
+    ip = m.text.strip()
+    if not is_ip(ip):
+        await m.answer("Это не похоже на IP-адрес.")
+        return
+    text, kb = await bans_view(await f2b_unban(ip))
+    await m.answer(text, reply_markup=kb)
+
+
+@dp.callback_query(F.data.startswith("unban:"))
+async def cb_unban(c: CallbackQuery) -> None:
+    ip = c.data.split(":", 1)[1]
+    note = await f2b_unban(ip) if is_ip(ip) else "Некорректный IP."
+    text, kb = await bans_view(note)
+    await c.message.edit_text(text, reply_markup=kb)
+    await c.answer()
+
+
+@dp.callback_query(F.data == "bans:refresh")
+async def cb_bans_refresh(c: CallbackQuery) -> None:
+    text, kb = await bans_view()
+    try:
+        await c.message.edit_text(text, reply_markup=kb)
+    except Exception:
+        pass  # «message is not modified» — список не изменился
+    await c.answer("Обновлено")
 
 
 CONFIRM_TEXT = "⚠️ Перезагрузить <code>{}</code>?\nПодтверждение действует {} с."
@@ -423,6 +560,7 @@ async def main() -> None:
     await bot.set_my_commands([
         BotCommand(command="status", description="Состояние сервера"),
         BotCommand(command="stats", description="Попытки входа за 24 ч"),
+        BotCommand(command="unban", description="Баны fail2ban и разбан"),
         BotCommand(command="reboot", description="Перезагрузить сервер"),
     ])
 

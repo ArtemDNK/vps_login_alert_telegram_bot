@@ -1,0 +1,26 @@
+# /etc/fail2ban/jail.d/sshd.local — защита SSH для Debian 13
+# Файлы jail.d/*.local читаются последними и перекрывают настройки по умолчанию.
+
+[DEFAULT]
+ignoreip = 127.0.0.1/8 ::1
+# Debian 13 пишет логи только в journald, /var/log/auth.log нет
+backend = systemd
+banaction = nftables-multiport
+banaction_allports = nftables-allports
+
+# 5 неудачных попыток за 10 минут — бан на 1 час
+findtime = 10m
+maxretry = 5
+bantime = 1h
+# каждый повторный бан того же IP в 2 раза дольше, максимум неделя
+bantime.increment = true
+bantime.factor = 2
+bantime.maxtime = 1w
+
+[sshd]
+enabled = true
+# aggressive ловит ещё и сканеры, которые рвут соединение до ввода пароля
+mode = aggressive
+# в Debian служба называется ssh.service, в OpenSSH 10 логи пишет sshd-session —
+# фильтр по юниту ловит все его записи
+journalmatch = _SYSTEMD_UNIT=ssh.service
