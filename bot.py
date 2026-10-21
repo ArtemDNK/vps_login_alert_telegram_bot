@@ -243,11 +243,13 @@ BTN_STATUS = "📊 Статус"
 BTN_STATS = "🛡 Попытки входа"
 BTN_REBOOT = "🔄 Перезагрузка"
 BTN_UNBAN = "🔓 Разбанить"
+BTN_UPDATE = "⬆️ Обновить"
 
 MAIN_KB = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text=BTN_STATUS), KeyboardButton(text=BTN_STATS)],
-        [KeyboardButton(text=BTN_UNBAN), KeyboardButton(text=BTN_REBOOT)],
+        [KeyboardButton(text=BTN_UNBAN), KeyboardButton(text=BTN_UPDATE)],
+        [KeyboardButton(text=BTN_REBOOT)],
     ],
     resize_keyboard=True,
     is_persistent=True,
@@ -438,7 +440,7 @@ async def cmd_start(m: Message) -> None:
     await m.answer(
         f"Слежу за входами на <code>{E(SERVER_NAME)}</code>: SSH, консоль, su, sudo.\n\n"
         "/status — состояние сервера\n/stats — попытки входа за 24 ч\n"
-        "/unban — баны fail2ban (или /unban IP)\n/reboot — перезагрузка",
+        "/unban — баны fail2ban (или /unban IP)\n/update — обновить пакеты\n/reboot — перезагрузка",
         reply_markup=MAIN_KB,
     )
 
@@ -527,12 +529,199 @@ async def cb_reboot_yes(c: CallbackQuery, notifier: Notifier) -> None:
         await c.message.edit_text("⌛ Подтверждение устарело — нажмите «Перезагрузка» ещё раз.")
         await c.answer()
         return
+    if await upgrade_running():
+        await c.answer("Идёт обновление пакетов — перезагрузка сейчас может сломать систему. "
+                       "Дождитесь итога.", show_alert=True)
+        return
     u = c.from_user
     log.warning("Перезагрузку запросил %s (id %s, @%s)", u.full_name, u.id, u.username)
     await c.message.edit_text(f"🔄 Перезагружаю <code>{E(SERVER_NAME)}</code>… Напишу, когда поднимется.")
     await c.answer("Перезагрузка…")
     await notifier.send(f"🔄 Перезагрузку <code>{E(SERVER_NAME)}</code> запросил {E(u.full_name)} (id {u.id})", exclude=u.id)
     asyncio.create_task(do_reboot(notifier))
+
+
+# ───────────────────────── обновление пакетов ─────────────────────────
+# apt запускается отдельным transient-юнитом systemd, а не дочерним процессом бота:
+#  • служба бота работает с ProtectSystem=full — изнутри неё /usr и /etc только для чтения;
+#  • если бот перезапустится во время обновления (например, needrestart), dpkg не будет убит.
+UPGRADE_UNIT = "vps-login-alert-upgrade"
+UPGRADE_LOG = "/var/log/vps-login-alert-upgrade.log"
+UPGRADE_CONFIRM_TTL = 600
+APT_OPTS = (
+    "-o DPkg::Lock::Timeout=300 "
+    "-o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold"
+)
+UPGRADE_SCRIPT = (
+    f"echo \"=== $(date '+%F %T') apt-get update\"; apt-get {APT_OPTS} update && "
+    f"echo \"=== $(date '+%F %T') apt-get full-upgrade\" && apt-get -y {APT_OPTS} full-upgrade && "
+    f"echo \"=== $(date '+%F %T') apt-get autoremove\" && apt-get -y {APT_OPTS} --purge autoremove && "
+    "apt-get clean; echo \"EXIT=$?\""
+)
+UPGRADE_ENV = ["DEBIAN_FRONTEND=noninteractive", "NEEDRESTART_MODE=l", "APT_LISTCHANGES_FRONTEND=none"]
+RX_UPGRADABLE = re.compile(r"^(\S+?)/\S+\s+(\S+)\s+\S+(?:\s+\[upgradable from:\s*(\S+)\])?")
+RX_APT_SUMMARY = re.compile(r"(\d+) upgraded, (\d+) newly installed, (\d+) to remove")
+
+upgrade_monitor: asyncio.Task | None = None
+
+
+async def upgrade_running() -> bool:
+    rc, _ = await run("systemctl", "is-active", "--quiet", UPGRADE_UNIT)
+    return rc == 0
+
+
+async def check_updates() -> tuple[list[tuple[str, str, str]] | None, str]:
+    """apt-get update + список обновлений: ([(пакет, старая, новая)], ошибка)."""
+    rc, out = await run(
+        "systemd-run", "--wait", "--pipe", "--quiet", "--collect",
+        *[f"--setenv={e}" for e in UPGRADE_ENV],
+        "sh", "-c", f"apt-get -q {APT_OPTS} update",
+    )
+    if rc != 0:
+        return None, out[-1500:]
+    rc, out = await run("apt", "list", "--upgradable")
+    pkgs = []
+    for line in out.splitlines():
+        if m := RX_UPGRADABLE.match(line.strip()):
+            pkgs.append((m[1], m[3] or "?", m[2]))
+    return pkgs, ""
+
+
+def upgrade_kb() -> InlineKeyboardMarkup:
+    ts = int(time.time())
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ Обновить всё", callback_data=f"upg:yes:{ts}"),
+        InlineKeyboardButton(text="❌ Отмена", callback_data="upg:no"),
+    ]])
+
+
+def reboot_required() -> list[str] | None:
+    if not os.path.exists("/run/reboot-required"):
+        return None
+    try:
+        with open("/run/reboot-required.pkgs") as f:
+            return sorted({x.strip() for x in f if x.strip()})
+    except OSError:
+        return []
+
+
+def log_tail(n: int = 25) -> str:
+    try:
+        with open(UPGRADE_LOG, errors="replace") as f:
+            lines = [ln.rstrip() for ln in f if ln.strip()]
+    except OSError:
+        return ""
+    return "\n".join(lines[-n:])
+
+
+async def monitor_upgrade(notifier: Notifier, started: float) -> None:
+    """Ждёт окончания обновления и присылает итог."""
+    while await upgrade_running():
+        await asyncio.sleep(5)
+    try:
+        with open(UPGRADE_LOG, errors="replace") as f:
+            log_text = f.read()
+    except OSError:
+        log_text = ""
+    m = re.search(r"^EXIT=(\d+)", log_text, re.M)
+    ok = m is not None and m[1] == "0"
+    took = fmt_dur(time.time() - started) if started else ""
+
+    lines = []
+    if ok:
+        lines.append(f"✅ <b>Обновление завершено</b> · <code>{E(SERVER_NAME)}</code>")
+        if s := RX_APT_SUMMARY.search(log_text):
+            lines.append(f"📦 Обновлено: {s[1]}, установлено новых: {s[2]}, удалено: {s[3]}")
+    else:
+        lines += [
+            f"❗️ <b>Обновление завершилось с ошибкой</b> · <code>{E(SERVER_NAME)}</code>",
+            f"Полный лог: <code>{UPGRADE_LOG}</code>",
+            f"<pre>{E(log_tail()[-2500:])}</pre>",
+        ]
+    if took:
+        lines.append(f"⏱ {took}")
+
+    markup = None
+    rr = reboot_required()
+    if rr is not None:
+        lines += ["", "⚠️ <b>Требуется перезагрузка</b>"]
+        if rr:
+            lines.append("Из-за: " + E(", ".join(rr[:10])) + (" …" if len(rr) > 10 else ""))
+        markup = REBOOT_INLINE
+    await notifier.send("\n".join(lines), reply_markup=markup)
+
+
+def start_monitor(notifier: Notifier, started: float = 0) -> None:
+    global upgrade_monitor
+    if upgrade_monitor is None or upgrade_monitor.done():
+        upgrade_monitor = asyncio.create_task(monitor_upgrade(notifier, started))
+
+
+@dp.message(Command("update"))
+@dp.message(F.text == BTN_UPDATE)
+async def cmd_update(m: Message) -> None:
+    if await upgrade_running():
+        await m.answer("⏳ Обновление уже идёт — пришлю итог, когда закончится.")
+        return
+    msg = await m.answer("🔎 Проверяю обновления (apt update)…")
+    pkgs, err = await check_updates()
+    if pkgs is None:
+        await msg.edit_text(f"❗️ apt update не удался:\n<pre>{E(err)}</pre>")
+        return
+    rr = reboot_required()
+    rr_note = "\n\n⚠️ Сервер уже ждёт перезагрузки после прошлого обновления." if rr is not None else ""
+    if not pkgs:
+        await msg.edit_text(
+            f"🟢 Все пакеты на <code>{E(SERVER_NAME)}</code> актуальны.{rr_note}",
+            reply_markup=REBOOT_INLINE if rr is not None else None,
+        )
+        return
+    lines = [f"⬆️ <b>Доступно обновлений: {len(pkgs)}</b> · <code>{E(SERVER_NAME)}</code>", ""]
+    for name, old, new in pkgs[:40]:
+        lines.append(f"<code>{E(name)}</code> {E(old)} → {E(new)}")
+    if len(pkgs) > 40:
+        lines.append(f"…и ещё {len(pkgs) - 40}")
+    lines.append(f"\nБудет выполнено apt full-upgrade + autoremove. Подтверждение действует {UPGRADE_CONFIRM_TTL // 60} мин.")
+    await msg.edit_text("\n".join(lines)[:4000] + rr_note, reply_markup=upgrade_kb())
+
+
+@dp.callback_query(F.data == "upg:no")
+async def cb_upgrade_no(c: CallbackQuery) -> None:
+    await c.message.edit_text("Обновление отменено.")
+    await c.answer()
+
+
+@dp.callback_query(F.data.startswith("upg:yes:"))
+async def cb_upgrade_yes(c: CallbackQuery, notifier: Notifier) -> None:
+    ts = int(c.data.rsplit(":", 1)[1])
+    if time.time() - ts > UPGRADE_CONFIRM_TTL or ts < time.time() - uptime():
+        await c.message.edit_text("⌛ Подтверждение устарело — нажмите «Обновить» ещё раз.")
+        await c.answer()
+        return
+    if await upgrade_running():
+        await c.answer("Обновление уже идёт", show_alert=True)
+        return
+    rc, out = await run(
+        "systemd-run", f"--unit={UPGRADE_UNIT}", "--collect", "--quiet",
+        "--description=Package upgrade requested via Telegram",
+        *[f"--setenv={e}" for e in UPGRADE_ENV],
+        f"--property=StandardOutput=truncate:{UPGRADE_LOG}",
+        "--property=StandardError=inherit",
+        "sh", "-c", UPGRADE_SCRIPT,
+    )
+    if rc != 0:
+        await c.message.edit_text(f"❗️ Не удалось запустить обновление:\n<pre>{E(out[:1000])}</pre>")
+        await c.answer()
+        return
+    u = c.from_user
+    log.warning("Обновление пакетов запросил %s (id %s)", u.full_name, u.id)
+    await c.message.edit_text(
+        f"⏳ Обновляю пакеты на <code>{E(SERVER_NAME)}</code>… Пришлю итог, когда закончится.\n"
+        f"Лог на сервере: <code>{UPGRADE_LOG}</code>"
+    )
+    await c.answer("Обновление запущено")
+    await notifier.send(f"⬆️ Обновление пакетов запросил {E(u.full_name)} (id {u.id})", exclude=u.id)
+    start_monitor(notifier, time.time())
 
 
 # ───────────────────────── запуск ─────────────────────────
@@ -561,8 +750,11 @@ async def main() -> None:
         BotCommand(command="status", description="Состояние сервера"),
         BotCommand(command="stats", description="Попытки входа за 24 ч"),
         BotCommand(command="unban", description="Баны fail2ban и разбан"),
+        BotCommand(command="update", description="Обновить пакеты"),
         BotCommand(command="reboot", description="Перезагрузить сервер"),
     ])
+    if await upgrade_running():  # бот перезапустился посреди обновления — дождёмся итога
+        start_monitor(notifier)
 
     up = uptime()
     if up < 600:
