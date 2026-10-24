@@ -5,9 +5,8 @@
 ignoreip = 127.0.0.1/8 ::1
 # Debian 13 пишет логи только в journald, /var/log/auth.log нет
 backend = systemd
-# бан на все порты сразу — сканер не сможет зайти ни на один сервис,
-# и бан не сломается, если вы смените порт SSH
-banaction = nftables-allports
+# бан только на порт SSH — остальные сервисы забаненному IP доступны
+banaction = nftables-multiport
 banaction_allports = nftables-allports
 
 # 3 неудачные попытки за сутки — бан на сутки
