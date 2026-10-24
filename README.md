@@ -107,11 +107,12 @@ logger -t sshd -p auth.info "Failed password for invalid user admin from 198.51.
 
 ## Защита от брутфорса: fail2ban
 
-Если в «🛡 Попытки входа» тысячи неудачных попыток, настройте fail2ban: после 5 неудачных попыток за 10 минут IP банится на час, а каждый повторный бан длится вдвое дольше (до недели). Готовый конфиг лежит в `fail2ban/sshd.local`.
+Если в «🛡 Попытки входа» тысячи неудачных попыток, настройте fail2ban: после 3 неудачных попыток за сутки IP банится на сутки сразу на всех портах, а каждый повторный бан длится вдвое дольше (до 5 недель). Готовый конфиг лежит в `fail2ban/sshd.local`.
 
 ```bash
 apt install -y fail2ban python3-systemd nftables
 cp /opt/vps_login_alert_telegram_bot/fail2ban/sshd.local /etc/fail2ban/jail.d/sshd.local
+fail2ban-client -t
 systemctl enable fail2ban
 systemctl restart fail2ban
 sleep 10 && fail2ban-client status sshd

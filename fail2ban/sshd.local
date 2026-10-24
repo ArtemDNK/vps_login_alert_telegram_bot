@@ -1,21 +1,23 @@
-# /etc/fail2ban/jail.d/sshd.local — защита SSH для Debian 13
+# /etc/fail2ban/jail.d/sshd.local — жёсткая защита SSH для Debian 13
 # Файлы jail.d/*.local читаются последними и перекрывают настройки по умолчанию.
 
 [DEFAULT]
 ignoreip = 127.0.0.1/8 ::1
 # Debian 13 пишет логи только в journald, /var/log/auth.log нет
 backend = systemd
-banaction = nftables-multiport
+# бан на все порты сразу — сканер не сможет зайти ни на один сервис,
+# и бан не сломается, если вы смените порт SSH
+banaction = nftables-allports
 banaction_allports = nftables-allports
 
-# 5 неудачных попыток за 10 минут — бан на 1 час
-findtime = 10m
-maxretry = 5
-bantime = 1h
-# каждый повторный бан того же IP в 2 раза дольше, максимум неделя
+# 3 неудачные попытки за сутки — бан на сутки
+findtime = 1d
+maxretry = 3
+bantime = 1d
+# каждый повторный бан того же IP в 2 раза дольше: 1 → 2 → 4 → 8 → 16 → 32 дня, максимум 5 недель
 bantime.increment = true
-bantime.factor = 2
-bantime.maxtime = 1w
+bantime.factor = 1
+bantime.maxtime = 5w
 
 [sshd]
 enabled = true
